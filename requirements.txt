@@ -1,0 +1,2 @@
+# ares-sc2 and its dependencies (install from GitHub; requires Python 3.11+)
+git+https://github.com/AresSC2/ares-sc2.git
