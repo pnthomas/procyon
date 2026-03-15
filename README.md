@@ -54,9 +54,9 @@ The ares-sc2 PyPI wheel does not include the `sc2_helper` package (used for comb
 |-------|--------------|
 | **1** | Setup + hello-world Terran bot *(done)* |
 | **2** | Standard macro: workers, supply, one simple build, basic Marines |
-| **3** | Ninja Turtle v0: Claimjumper, Larceny Ledger, turtle (bunkers, PF, float CCs), marine waves |
-| **4** | Polish + extra modules (creep lawnmower, Viking squads, overlord denial, Marauder harass) |
+| **3** | Ninja Turtle v0: Claimjumper, Larceny Ledger, turtlely expand w/ bunkers and floated CCs into PFs, marine waves |
+| **4** | Ninja Turtle v1: Polish + extra modules (creep lawnmower, Viking squads, overlord denial, Marauder harass) |
 | **5** | AI Arena readiness |
 | **6** | Future work: repair strategies, Chill tanks, underexplored units, more strategies |
 
-Full roadmap and module details are in the project plan (e.g. `.cursor/plans/` or your planning docs).
+Full strategic roadmap and module details: [roadmap.md](roadmap.md).
