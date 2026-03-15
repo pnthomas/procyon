@@ -38,6 +38,16 @@ python bot.py
 
 This runs Procyon (Terran) vs the built-in Zerg Easy AI on the map `TorchesAIE_v4`. If that map is missing, edit `bot.py` and change the map name in `main()` to one you have in your Maps folder.
 
+### Debug tags
+
+Set `PROCYON_DEBUG` to a comma-separated list of tags to get extra terminal and in-game chat output for that behavior. Example:
+
+```bash
+PROCYON_DEBUG=build_order,macro python bot.py
+```
+
+Tags: `build_order` (opening / build runner), `macro` (reserved for future use).
+
 ### Vendored sc2_helper
 
 The ares-sc2 PyPI wheel does not include the `sc2_helper` package (used for combat simulation). This repo vendors `sc2_helper` (Python files + the Python 3.11 Darwin `.so`) in `vendor/sc2_helper/` so the bot runs without a development install of ares-sc2. The bot adds `vendor` to `sys.path` before importing ares.

@@ -1,0 +1,32 @@
+# Procyon Terran opener: 2 depots, 2 barracks, support for 12 marines + workers.
+# Build Runner runs this opening; bot handles marine production and supply after.
+UseData: False
+BuildSelection: Cycle
+
+BuildChoices:
+    Terran:
+        BotName: Procyon
+        Cycle:
+            - TwoRaxMarines
+    Zerg:
+        BotName: Procyon
+        Cycle:
+            - TwoRaxMarines
+    Protoss:
+        BotName: Procyon
+        Cycle:
+            - TwoRaxMarines
+    Random:
+        BotName: Procyon
+        Cycle:
+            - TwoRaxMarines
+
+Builds:
+    TwoRaxMarines:
+        # Keep training SCVs during the opening until 22 supply.
+        ConstantWorkerProductionTill: 22
+        OpeningBuildOrder:
+            - "14 supply @ ramp"   # First Supply Depot (before barracks)
+            - "15 barracks @ ramp" # First Barracks
+            - "17 supply @ ramp"   # Second Depot (room for workers + 12 marines)
+            - "18 barracks @ ramp" # Second Barracks
