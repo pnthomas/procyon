@@ -50,6 +50,15 @@ Only the modules Ninja Turtle v0 needs first.
 - **Production:** Barracks (and later factory/starport if needed) producing mainly Marines; “increasingly large waves” = batch into groups and send on attack command at intervals.
 - **Upgrades:** Infantry upgrades (e.g. +1 weapons, then armor) when engineering bay is available.
 
+### 3.5 Build architecture (modular mix-and-match)
+
+- **Goal:** Build definitions compose reusable modules, instead of hard-coding one monolithic on-step script.
+- **Build config:** Each build declares: opening/build-runner name, enabled modules, and module params (timing, unit mix, expansion style).
+- **Core modules (initial):** `claimjumper_opening`, `normal_expand`, `marine_core`, `viking_transition`, `hellbat_bc_transition`.
+- **Execution model:** Keep one orchestrator that runs enabled modules in priority order each frame; modules own their own one-shot latches and state.
+- **Debug model:** Debug tags report module telemetry (e.g. claimjumper SCV trace) but do not define strategy behavior.
+- **Near-term build IDs:** `standard`, `claimjumper`, `claimjumper_marine_viking`, `claimjumper_hellbat_bc`.
+
 **Deliverable:** Ninja Turtle v0 playable: turtle at home, Claimjumper at enemy 4th, Larceny Ledger tracking ninja income, marine waves with upgrades.
 
 ---
@@ -85,6 +94,7 @@ Only the modules Ninja Turtle v0 needs first.
 ## Chores
 
 - **Config:** Map name (and optionally race/difficulty) from config or env so the same code can later target AI Arena.
+- **Build selection config:** Build/strategy name from config or env (`PROCYON_BUILD` now; later promote to a stable config surface for Arena/runtime).
 - **Polish (later):** (1) Depot/barracks "order once" logic: add robustness when the assigned SCV never starts construction (e.g. destroyed or blocked)—e.g. timeout or retry and clear the pending flag. (2) Ares placement is brittle and relies on map assumptions; add fallback to building near a safe point (e.g. ramp) if request_building_placement fails or the build never proceeds.
 - Ledger accounting is kinda fudgy; it can't track exact deposits so it tracks state changes of any SCVs nearby. It also doesn't track the exact value of a given base, it's just a static guess based on 20 SCVs, a PF, and 2 extractors.
 

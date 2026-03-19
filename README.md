@@ -36,7 +36,21 @@ With the venv activated:
 python bot.py
 ```
 
-This runs Procyon (Terran) vs the built-in Zerg Easy AI on the map `TorchesAIE_v4`. If that map is missing, edit `bot.py` and change the map name in `main()` to one you have in your Maps folder.
+This runs Procyon (Terran) vs the built-in Zerg Easy AI on the map `IncorporealAIE_v4` by default. Override the map with `PROCYON_MAP` to run others from your SC2 Maps folder.
+
+You can override the map at runtime with `PROCYON_MAP`:
+
+```bash
+PROCYON_MAP=IncorporealAIE_v4 python bot.py
+```
+
+You can choose a build/strategy with `PROCYON_BUILD`:
+
+```bash
+PROCYON_BUILD=standard python bot.py
+PROCYON_BUILD=claimjumper python bot.py
+PROCYON_BUILD=claimjumper_marine_viking python bot.py
+```
 
 ### Debug tags
 
@@ -46,7 +60,14 @@ Set `PROCYON_DEBUG` to a comma-separated list of tags to get extra terminal and 
 PROCYON_DEBUG=build_order,macro python bot.py
 ```
 
-Tags: `build_order` (opening / build runner), `macro` (reserved for future use).
+Tags:
+- `build_order`: opening / build runner
+- `macro`: reserved for future use
+- `claimjumper`: log claimjumper target position when computed
+- `expand_baseline`: minimal baseline (suspend macro/build-order, keep mining, use built-in `expand_now()` to take natural, log started/completed)
+- `claimjumper_location`: SCV telemetry for claimjumper behavior (orders, movement, distance, action errors)
+  - Claimjumper itself is selected by `PROCYON_BUILD=claimjumper...` and is one-shot: after the first accepted CC order, it will not issue further claimjumper rebuild attempts.
+  - Includes a pathing error report if the SCV repeatedly hits `result=208` / `ability=318` while stationary (suggesting map/pathing geometry issues).
 
 ### Vendored sc2_helper
 
