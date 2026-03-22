@@ -24,9 +24,10 @@ from typing import TYPE_CHECKING
 
 from ares import AresBot
 from ares.consts import UnitRole
-from sc2.data import ActionResult
+from sc2.data import ActionResult, Result
 from sc2.ids.ability_id import AbilityId
 from sc2.ids.unit_typeid import UnitTypeId
+from sc2.unit_command import UnitCommand
 
 if TYPE_CHECKING:
     from sc2.position import Point2
@@ -35,6 +36,16 @@ if TYPE_CHECKING:
 def _parse_debug_tags() -> set:
     """Parse PROCYON_DEBUG env (comma-separated), e.g. build_order,macro. Empty = no debug output."""
     raw = os.environ.get("PROCYON_DEBUG", "").strip()
+    return set(filter(None, (s.strip() for s in raw.split(","))))
+
+
+def _parse_verify_strategies() -> set:
+    """
+    Parse PROCYON_VERIFY (comma-separated strategy names, lowercase).
+    Enables one-shot milestone lines to terminal + in-game chat for post-game review.
+    Example: PROCYON_VERIFY=claimjumper
+    """
+    raw = os.environ.get("PROCYON_VERIFY", "").strip().lower()
     return set(filter(None, (s.strip() for s in raw.split(","))))
 
 
@@ -51,11 +62,179 @@ class ProcyonBot(AresBot):
     CLAIMJUMPER_PATHING_STAGNANT_MOVE_DELTA = 0.35
     CLAIMJUMPER_PATHING_STAGNANT_TIME_S = 9.0
     CLAIMJUMPER_UNREACHABLE_STREAK_FOR_REPORT = 3
+    # PF / gas: eBay should be ready within this many seconds of claimjumper CC completion.
+    CLAIMJUMPER_EBAY_DEADLINE_AFTER_CC_S = 12.0
+    CLAIMJUMPER_REFINERY_RADIUS = 10.0
+    CLAIMJUMPER_STAFF_RADIUS = 20.0
+    CLAIMJUMPER_GAS_SLOTS_PER_REFINERY = 3
+    CLAIMJUMPER_REFS_BEFORE_PF = 2
+    # Larceny Ledger (§3.2): resources attributed to the claimjump townhall only.
+    LARCENY_DEPOSIT_PROXIMITY = 5.5
+    LARCENY_MINERALS_PER_TRIP = 8
+    LARCENY_GAS_PER_TRIP = 4
+    LARCENY_EST_INVEST_MINERALS = 1700
+    LARCENY_EST_INVEST_GAS = 150
+    # Expected milestone ids for PROCYON_VERIFY=claimjumper (on_end summary).
+    CLAIMJUMPER_VERIFY_EXPECTED_STEPS = (
+        "cj_scv_dispatched",
+        "cj_scv_arrived",
+        "cj_cc_order_issued",
+        "cj_cc_built",
+        "cj_extractor_1of2",
+        "cj_extractor_2of2",
+        "cj_extractors_gas_saturated",
+        "cj_bank_150gas",
+        "cj_pf_order_issued",
+        "cj_pf_complete",
+    )
 
     def _debug_tags(self) -> set:
         if not hasattr(self, "_cached_debug_tags"):
             self._cached_debug_tags = _parse_debug_tags()
         return self._cached_debug_tags
+
+    def _verify_strategies(self) -> set:
+        if not hasattr(self, "_cached_verify_strategies"):
+            self._cached_verify_strategies = _parse_verify_strategies()
+        return self._cached_verify_strategies
+
+    def _verify_enabled(self, strategy: str) -> bool:
+        return strategy.lower() in self._verify_strategies()
+
+    def _verify_was_hit(self, strategy: str, step_id: str) -> bool:
+        return (strategy, step_id) in getattr(self, "_verify_latched", set())
+
+    async def _verify_hit(
+        self, strategy: str, step_id: str, detail: str = "", *, chat: bool = True
+    ) -> None:
+        """
+        One-shot milestone: print + optional chat. Independent of PROCYON_DEBUG.
+        Format: [VERIFY][strategy] step_id | detail
+        """
+        if not self._verify_enabled(strategy):
+            return
+        if not hasattr(self, "_verify_latched"):
+            self._verify_latched = set()
+        key = (strategy, step_id)
+        if key in self._verify_latched:
+            return
+        self._verify_latched.add(key)
+        msg = f"{step_id}" + (f" | {detail}" if detail else "")
+        line = f"[VERIFY][{strategy}] {msg}"
+        print(line)
+        if chat:
+            try:
+                client = getattr(self, "_client", None)
+                if client and hasattr(client, "chat_send"):
+                    await client.chat_send(line[:240], team_only=False)
+            except Exception:
+                pass
+
+    async def _verify_warn_once(
+        self, strategy: str, warn_id: str, detail: str = "", *, chat: bool = True
+    ) -> None:
+        if not self._verify_enabled(strategy):
+            return
+        if not hasattr(self, "_verify_warn_latched"):
+            self._verify_warn_latched = set()
+        key = (strategy, warn_id)
+        if key in self._verify_warn_latched:
+            return
+        self._verify_warn_latched.add(key)
+        line = f"[VERIFY][{strategy}] WARN {warn_id}" + (f" | {detail}" if detail else "")
+        print(line)
+        if chat:
+            try:
+                client = getattr(self, "_client", None)
+                if client and hasattr(client, "chat_send"):
+                    await client.chat_send(line[:240], team_only=False)
+            except Exception:
+                pass
+
+    async def _verify_claimjumper_milestones(self) -> None:
+        """
+        Game-state milestones for claimjumper (PROCYON_VERIFY=claimjumper).
+        See README: Verification / self-evaluation.
+        """
+        if not self._verify_enabled("claimjumper") or not self._claimjumper_enabled():
+            return
+        target = self.get_claimjumper_target()
+        if target is None:
+            return
+
+        ready_th = self._townhall_at_point(target)
+        cc_pending = self.structures(UnitTypeId.COMMANDCENTER).not_ready.closer_than(9, target)
+
+        pt = getattr(self, "_claimjumper_debug_worker_tag", None)
+        pioneer = self.workers.find_by_tag(pt) if pt and self.workers else None
+        if pt and pioneer is not None:
+            await self._verify_hit("claimjumper", "cj_scv_dispatched", f"tag={pt}")
+            if not getattr(self, "_verify_claimjumper_dispatch_time", None):
+                self._verify_claimjumper_dispatch_time = self.time
+
+        if pioneer is not None and pioneer.position.distance_to(target) < self.CLAIMJUMPER_ARRIVAL_RADIUS:
+            await self._verify_hit(
+                "claimjumper",
+                "cj_scv_arrived",
+                f"dist<{self.CLAIMJUMPER_ARRIVAL_RADIUS:.0f}",
+            )
+
+        if getattr(self, "_claimjumper_cc_order_logged", False):
+            await self._verify_hit("claimjumper", "cj_cc_order_issued", "build order accepted")
+
+        if cc_pending:
+            p = cc_pending.first.position
+            await self._verify_hit("claimjumper", "cj_cc_under_construction", f"at {p.x:.0f},{p.y:.0f}")
+
+        if ready_th is not None and ready_th.type_id == UnitTypeId.COMMANDCENTER:
+            await self._verify_hit("claimjumper", "cj_cc_built", "COMMANDCENTER ready")
+
+        if self._engineering_bay_ready():
+            await self._verify_hit("claimjumper", "cj_ebay_ready", "PF tech available")
+
+        anchor = ready_th or (cc_pending.first if cc_pending else None)
+        if anchor is not None:
+            refs = self.structures(UnitTypeId.REFINERY).closer_than(
+                self.CLAIMJUMPER_REFINERY_RADIUS + 2.0, anchor.position
+            )
+            if len(refs) >= 1:
+                await self._verify_hit("claimjumper", "cj_extractor_1of2", f"refs={len(refs)}")
+            if len(refs) >= 2:
+                await self._verify_hit("claimjumper", "cj_extractor_2of2", f"refs={len(refs)}")
+            refs_r = refs.ready
+            target_gas = self.CLAIMJUMPER_GAS_SLOTS_PER_REFINERY * len(refs_r)
+            if target_gas > 0:
+                on_gas = len(self._claimjumper_gas_worker_tags_near_refs(refs_r))
+                if on_gas >= target_gas:
+                    await self._verify_hit(
+                        "claimjumper",
+                        "cj_extractors_gas_saturated",
+                        f"{on_gas}/{target_gas} scv near refs",
+                    )
+
+        if ready_th is not None and self.vespene >= 150:
+            await self._verify_hit("claimjumper", "cj_bank_150gas", f"vespene={self.vespene}")
+
+        if getattr(self, "_claimjumper_pf_upgrade_logged", False):
+            await self._verify_hit("claimjumper", "cj_pf_order_issued", "morph command issued")
+
+        if ready_th is not None and self._claimjumper_morphing_to_pf(ready_th):
+            await self._verify_hit("claimjumper", "cj_pf_morphing", "morph in progress")
+
+        if ready_th is not None and ready_th.type_id == UnitTypeId.PLANETARYFORTRESS:
+            await self._verify_hit("claimjumper", "cj_pf_complete", "PLANETARYFORTRESS")
+
+        t0 = getattr(self, "_verify_claimjumper_dispatch_time", None)
+        if (
+            t0 is not None
+            and not self._verify_was_hit("claimjumper", "cj_scv_arrived")
+            and self.time - t0 > 50.0
+        ):
+            await self._verify_warn_once(
+                "claimjumper",
+                "cj_warn_scv_blocked",
+                f"{self.time - t0:.0f}s no arrival (wall/path?)",
+            )
 
     def _active_build(self) -> str:
         """
@@ -69,6 +248,92 @@ class ProcyonBot(AresBot):
     def _claimjumper_enabled(self) -> bool:
         """Whether current selected build uses claimjumper opening behavior."""
         return self._active_build().startswith("claimjumper")
+
+    def _larceny_ninja_townhall(self):
+        """Ready CC/PF at the claimjumper expansion (deposit target for ledger). None if not up yet."""
+        if not self._claimjumper_enabled():
+            return None
+        t = self.get_claimjumper_target()
+        if t is None:
+            return None
+        th = self._townhall_at_point(t, radius=8.0)
+        if th is None or not th.is_ready:
+            return None
+        if not self._is_claimjumper_townhall(th):
+            return None
+        if th.type_id not in (UnitTypeId.COMMANDCENTER, UnitTypeId.PLANETARYFORTRESS):
+            return None
+        return th
+
+    def _larceny_harvest_units(self):
+        """SCVs and MULEs that can deposit at a townhall."""
+        for u in self.units(UnitTypeId.SCV):
+            yield u
+        for u in self.units(UnitTypeId.MULE):
+            yield u
+
+    def _larceny_tick(self) -> None:
+        """
+        Attribute gathered minerals/gas to the ninja base only: on transition from carrying to not
+        carrying, if the unit is near the claimjump townhall, credit a standard trip (8m / 4g).
+        """
+        if not self._claimjumper_enabled():
+            return
+        ninja = self._larceny_ninja_townhall()
+        if ninja is None:
+            return
+        self._larceny_ninja_th_tag = ninja.tag
+        prev = getattr(self, "_larceny_prev_carry", {})
+        new_carry: dict = {}
+        m_ledger = getattr(self, "_larceny_gathered_minerals", 0)
+        v_ledger = getattr(self, "_larceny_gathered_vespene", 0)
+        prox = self.LARCENY_DEPOSIT_PROXIMITY
+
+        for w in self._larceny_harvest_units():
+            tag = w.tag
+            pm = prev.get(tag, (False, False))[0]
+            pg = prev.get(tag, (False, False))[1]
+            cm = w.is_carrying_minerals
+            cg = w.is_carrying_vespene
+            new_carry[tag] = (cm, cg)
+            if w.position.distance_to(ninja.position) > prox:
+                continue
+            if pm and not cm:
+                m_ledger += self.LARCENY_MINERALS_PER_TRIP
+            if pg and not cg:
+                v_ledger += self.LARCENY_GAS_PER_TRIP
+
+        self._larceny_prev_carry = new_carry
+        self._larceny_gathered_minerals = m_ledger
+        self._larceny_gathered_vespene = v_ledger
+
+    def _larceny_print_summary_line(self, label: str) -> None:
+        m = getattr(self, "_larceny_gathered_minerals", 0)
+        g = getattr(self, "_larceny_gathered_vespene", 0)
+        em, eg = self.LARCENY_EST_INVEST_MINERALS, self.LARCENY_EST_INVEST_GAS
+        print(
+            f"[Larceny] {label} gathered={m} minerals {g} gas "
+            f"(est. invested ~{em}m ~{eg}g; net ~{m - em}m ~{g - eg}g)"
+        )
+
+    async def _larceny_on_ninja_base_lost(self) -> None:
+        if getattr(self, "_larceny_destroy_reported", False):
+            return
+        self._larceny_destroy_reported = True
+        self._larceny_print_summary_line("Ninja base destroyed —")
+        if "larceny_ledger" in self._debug_tags():
+            try:
+                client = getattr(self, "_client", None)
+                if client and hasattr(client, "chat_send"):
+                    m = getattr(self, "_larceny_gathered_minerals", 0)
+                    g = getattr(self, "_larceny_gathered_vespene", 0)
+                    await client.chat_send(
+                        f"[Larceny] lost base: gathered {m}m {g}g (est. invest "
+                        f"{self.LARCENY_EST_INVEST_MINERALS}m {self.LARCENY_EST_INVEST_GAS}g)",
+                        team_only=False,
+                    )
+            except Exception:
+                pass
 
     def _claimjumper_trace_enabled(self) -> bool:
         """Trace-only flag for claimjumper SCV telemetry."""
@@ -187,6 +452,354 @@ class ProcyonBot(AresBot):
         townhalls = self.townhalls.closer_than(radius, point) if self.townhalls else None
         return townhalls.first if townhalls else None
 
+    def _macro_placement_anchor(self) -> "Point2":
+        """Townhall closest to our start — depots/rax/eBay should anchor here, not on a forward claimjumper CC."""
+        if not self.townhalls:
+            return self.start_location
+        return min(self.townhalls, key=lambda th: th.position.distance_to(self.start_location)).position
+
+    def _is_claimjumper_townhall(self, th) -> bool:
+        if not self._claimjumper_enabled():
+            return False
+        t = self.get_claimjumper_target()
+        if t is None:
+            return False
+        return th.position.distance_to(t) <= 8.0
+
+    def _claimjumper_staffing_anchor_position(self) -> "Point2 | None":
+        """TH position if the claim is up, else the expansion target (for geofencing)."""
+        t = self.get_claimjumper_target()
+        if t is None:
+            return None
+        th = self._townhall_at_point(t)
+        return th.position if th is not None else t
+
+    def _worker_in_claimjumper_staffing_zone(self, worker) -> bool:
+        """SCVs here are staffed gas-first by claimjumper logic — never auto-send to main minerals."""
+        if not self._claimjumper_enabled():
+            return False
+        anchor = self._claimjumper_staffing_anchor_position()
+        if anchor is None:
+            return False
+        return worker.distance_to(anchor) <= self.CLAIMJUMPER_STAFF_RADIUS + 2.0
+
+    def _select_worker_for_main_base_build(self, pos: "Point2"):
+        """Avoid assigning claimjumper-site SCVs to depots/rax/eBay at the main."""
+        if not self._claimjumper_enabled():
+            return self.mediator.select_worker(target_position=pos)
+        outside = [w for w in self.workers if not self._worker_in_claimjumper_staffing_zone(w)]
+        if not outside:
+            return self.mediator.select_worker(target_position=pos)
+        return min(outside, key=lambda w: w.distance_to(pos))
+
+    def _engineering_bay_ready(self) -> bool:
+        return bool(self.structures(UnitTypeId.ENGINEERINGBAY).ready)
+
+    def _engineering_bay_pending_count(self) -> int:
+        if hasattr(self, "structure_pending"):
+            return int(self.structure_pending(UnitTypeId.ENGINEERINGBAY))
+        return int(self.mediator.get_building_counter.get(UnitTypeId.ENGINEERINGBAY, 0))
+
+    async def _ensure_claimjumper_engineering_bay(self) -> None:
+        """
+        Build one Engineering Bay at the main base for Planetary Fortress tech.
+        Started as soon as the claimjumper CC is ordered or building (~35s build vs ~100s CC).
+        """
+        if self._engineering_bay_ready() or self._engineering_bay_pending_count() > 0:
+            return
+        if not self.can_afford(UnitTypeId.ENGINEERINGBAY):
+            return
+        base = self._macro_placement_anchor()
+        pos = self.mediator.request_building_placement(
+            base_location=base,
+            structure_type=UnitTypeId.ENGINEERINGBAY,
+            wall=False,
+            find_alternative=True,
+        )
+        if pos is None:
+            return
+        worker = self._select_worker_for_main_base_build(pos)
+        if worker is None:
+            return
+        self.mediator.build_with_specific_worker(
+            worker=worker,
+            structure_type=UnitTypeId.ENGINEERINGBAY,
+            pos=pos,
+        )
+
+    def _geyser_has_refinery(self, geyser) -> bool:
+        return bool(self.structures(UnitTypeId.REFINERY).closer_than(1.0, geyser.position))
+
+    def _pioneer_has_refinery_build_order(self, pioneer) -> bool:
+        if pioneer is None or not pioneer.orders:
+            return False
+        for o in pioneer.orders:
+            ab = getattr(o, "ability", None)
+            aid = getattr(ab, "id", ab) if ab is not None else None
+            if aid == AbilityId.TERRANBUILD_REFINERY:
+                return True
+        return False
+
+    def _claimjumper_refineries_near(self, cc):
+        return self.structures(UnitTypeId.REFINERY).closer_than(
+            self.CLAIMJUMPER_REFINERY_RADIUS + 2.0, cc.position
+        )
+
+    async def _claimjumper_pioneer_build_refinery(self, pioneer, geyser, cc) -> bool:
+        """Only the pioneer SCV builds claimjumper gas — avoids pulling workers from the main base."""
+        if pioneer is None or not self.can_afford(UnitTypeId.REFINERY):
+            return False
+        if self._pioneer_has_refinery_build_order(pioneer):
+            return True
+        try:
+            before = len(self._claimjumper_refineries_near(cc))
+            ok = await self.build(
+                UnitTypeId.REFINERY,
+                near=geyser,
+                max_distance=1,
+                build_worker=pioneer,
+                random_alternative=False,
+                placement_step=1,
+            )
+            if ok:
+                idx = min(before + 1, self.CLAIMJUMPER_REFS_BEFORE_PF)
+                await self._verify_hit(
+                    "claimjumper",
+                    f"cj_refinery_{idx}of2_order",
+                    "build_gas issued",
+                )
+            return ok
+        except Exception:
+            return False
+
+    def _claimjumper_next_open_geyser(self, cc):
+        geysers = list(
+            self.vespene_geyser.closer_than(self.CLAIMJUMPER_REFINERY_RADIUS, cc.position)
+        )
+        geysers.sort(key=lambda g: (g.position.x, g.position.y))
+        for g in geysers:
+            if not self._geyser_has_refinery(g):
+                return g
+        return None
+
+    def _claimjumper_morphing_to_pf(self, cc) -> bool:
+        for order in cc.orders:
+            ab = getattr(order, "ability", None)
+            aid = getattr(ab, "id", ab) if ab is not None else None
+            if aid == AbilityId.UPGRADETOPLANETARYFORTRESS_PLANETARYFORTRESS:
+                return True
+        return False
+
+    def _claimjumper_unit_do_safe(self, unit, ability: AbilityId, *, subtract_cost: bool = False, **kwargs) -> bool:
+        """Issue a unit ability; Ares may return a UnitCommand that must be passed to self.do."""
+        raw = unit(ability, subtract_cost=subtract_cost, **kwargs)
+        if isinstance(raw, UnitCommand):
+            return bool(self.do(raw, subtract_cost=subtract_cost))
+        return bool(raw)
+
+    def _claimjumper_cancel_cc_scv_training(self, cc) -> bool:
+        """
+        Clear one queued SCV train so PF morph can start (one cancel per frame; repeat if needed).
+        Returns True if a cancel was issued.
+        """
+        if not cc.orders:
+            return False
+        ab = getattr(cc.orders[0], "ability", None)
+        aid = getattr(ab, "id", ab) if ab is not None else None
+        if aid != AbilityId.COMMANDCENTERTRAIN_SCV:
+            return False
+        return self._claimjumper_unit_do_safe(cc, AbilityId.CANCEL_LAST)
+
+    def _issue_pf_upgrade(self, cc) -> bool:
+        """Queue PF morph; handles both immediate-do and deferred UnitCommand (Ares) styles."""
+        return self._claimjumper_unit_do_safe(
+            cc,
+            AbilityId.UPGRADETOPLANETARYFORTRESS_PLANETARYFORTRESS,
+            subtract_cost=True,
+        )
+
+    def _claimjumper_reassert_pioneer_scouting(self, pioneer) -> None:
+        if pioneer is None:
+            return
+        try:
+            self.mediator.assign_role(tag=pioneer.tag, role=UnitRole.SCOUTING)
+        except Exception:
+            pass
+
+    def _claimjumper_pioneer_mine_local_gas(self, cc, pioneer) -> None:
+        """Bank gas at the claim for PF without walking to the main mineral line."""
+        if pioneer is None or not pioneer.is_idle:
+            return
+        ready = self._claimjumper_refineries_near(cc).ready
+        if not ready:
+            return
+        pioneer.gather(ready.closest_to(pioneer.position))
+
+    def _claimjumper_queue_scvs_pre_pf(self, cc) -> None:
+        """
+        Pre-PF: at most one SCV training at a time so the CC can clear for PF morph when gas is ready.
+        """
+        if cc.orders:
+            return
+        if self.supply_cap - self.supply_used < 1:
+            return
+        if not self.can_afford(UnitTypeId.SCV):
+            return
+        cc.train(UnitTypeId.SCV, queue=False)
+
+    def _claimjumper_queue_scvs_to_saturation(self, cc) -> None:
+        """Post-PF: same idea as a normal expansion — train until this base is saturated."""
+        supply_left = self.supply_cap - self.supply_used
+        for i in range(min(5, max(0, supply_left))):
+            if not self.can_afford(UnitTypeId.SCV) or self._base_saturated(cc):
+                break
+            if len(cc.orders) >= 5:
+                break
+            cc.train(UnitTypeId.SCV, queue=i > 0)
+
+    async def _develop_claimjumper_cc_phase(self, cc, pioneer, tag: str) -> None:
+        """
+        Command Center at claimjumper: pioneer builds both refineries, then SCVs + gas staffing
+        until PF is affordable, then morph. (Unique claimjumper opener ends at PF complete.)
+        """
+        if not getattr(self, "_claimjumper_cc_ready_time", None):
+            self._claimjumper_cc_ready_time = self.time
+            await self._log(
+                tag,
+                (
+                    f"Claimjumper CC ready at {cc.position}; {self.CLAIMJUMPER_REFS_BEFORE_PF} refineries, "
+                    f"then SCVs until PF affordable (eBay within {self.CLAIMJUMPER_EBAY_DEADLINE_AFTER_CC_S}s)."
+                ),
+                chat=True,
+            )
+
+        t0 = self._claimjumper_cc_ready_time
+        if (
+            self.time > t0 + self.CLAIMJUMPER_EBAY_DEADLINE_AFTER_CC_S
+            and not self._engineering_bay_ready()
+            and not getattr(self, "_claimjumper_ebay_deadline_logged", False)
+        ):
+            self._claimjumper_ebay_deadline_logged = True
+            await self._log(
+                tag,
+                "Engineering Bay not ready within 12s after claimjumper CC completed (PF may be delayed).",
+                chat=True,
+            )
+
+        ref_count = len(self._claimjumper_refineries_near(cc))
+        if ref_count < self.CLAIMJUMPER_REFS_BEFORE_PF:
+            g = self._claimjumper_next_open_geyser(cc)
+            if g is not None and pioneer is not None:
+                await self._claimjumper_pioneer_build_refinery(pioneer, g, cc)
+            return
+
+        self._claimjumper_staff_idle_workers_gas_first(cc)
+
+        morph_now = (
+            self._engineering_bay_ready()
+            and self.can_afford(AbilityId.UPGRADETOPLANETARYFORTRESS_PLANETARYFORTRESS)
+            and not self._claimjumper_morphing_to_pf(cc)
+        )
+        if morph_now:
+            if self._claimjumper_cancel_cc_scv_training(cc):
+                return
+            ok = self._issue_pf_upgrade(cc)
+            if ok:
+                self._claimjumper_pf_queued = True
+                if not getattr(self, "_claimjumper_pf_upgrade_logged", False):
+                    self._claimjumper_pf_upgrade_logged = True
+                    await self._log(tag, "Planetary Fortress upgrade issued at claimjumper base.", chat=True)
+            return
+
+        self._claimjumper_queue_scvs_pre_pf(cc)
+        self._claimjumper_pioneer_mine_local_gas(cc, pioneer)
+
+    async def _claimjumper_pioneer_during_pf_morph(self, cc, pioneer, tag: str) -> None:
+        """Both refineries already built; during morph keep workers on gas/minerals."""
+        self._claimjumper_staff_idle_workers_gas_first(cc)
+        self._claimjumper_pioneer_mine_local_gas(cc, pioneer)
+
+    def _claimjumper_gas_worker_tags_near_refs(self, refs_ready) -> set:
+        tags: set = set()
+        for r in refs_ready:
+            for w in self.units(UnitTypeId.SCV).closer_than(5.0, r.position):
+                tags.add(w.tag)
+        return tags
+
+    def _claimjumper_staff_claimsite_workers_gas_first(self, cc) -> None:
+        """
+        All SCVs near the claim (not only idle): fill gas first, then local minerals.
+        Re-issues gather so Ares / mineral shortcuts cannot leave workers on wrong patches.
+        """
+        refs_ready = self._claimjumper_refineries_near(cc).ready
+        target_gas = self.CLAIMJUMPER_GAS_SLOTS_PER_REFINERY * len(refs_ready)
+        minerals = self.mineral_field.closer_than(self.CLAIMJUMPER_STAFF_RADIUS, cc.position)
+        claim_scvs = self.units(UnitTypeId.SCV).closer_than(
+            self.CLAIMJUMPER_STAFF_RADIUS, cc.position
+        )
+        pioneer_tag = getattr(self, "_claimjumper_debug_worker_tag", None)
+
+        for w in claim_scvs:
+            if pioneer_tag is not None and w.tag == pioneer_tag:
+                continue
+            gas_tags = self._claimjumper_gas_worker_tags_near_refs(refs_ready)
+            if target_gas > 0 and len(gas_tags) < target_gas and refs_ready:
+                if w.tag not in gas_tags:
+                    best = min(
+                        refs_ready,
+                        key=lambda r: len(
+                            self.units(UnitTypeId.SCV).closer_than(5.0, r.position)
+                        ),
+                    )
+                    w.gather(best)
+                continue
+            if (target_gas == 0 or len(gas_tags) >= target_gas) and minerals and w.is_idle:
+                w.gather(minerals.closest_to(w.position))
+
+    def _claimjumper_staff_idle_workers_gas_first(self, cc) -> None:
+        """Backward-compatible name: full claim-site staffing."""
+        self._claimjumper_staff_claimsite_workers_gas_first(cc)
+
+    async def _develop_claimjumper_pf_economy(self, cc, tag: str) -> None:
+        """PF complete: behaves like a normal expansion (saturation + gas-first staffing)."""
+        self._claimjumper_queue_scvs_to_saturation(cc)
+        self._claimjumper_staff_idle_workers_gas_first(cc)
+
+    async def _develop_claimjumper_base(self, cc, tag: str) -> None:
+        """
+        Stealth claimjumper: pioneer builds both refineries (no main pulls); pre-PF SCVs bank gas;
+        PF morph then normal saturation. (Flee/repair/scatter TBD — shared with other bases later.)
+        """
+        if not self._is_claimjumper_townhall(cc):
+            return
+
+        await self._ensure_claimjumper_engineering_bay()
+
+        pioneer_tag = getattr(self, "_claimjumper_debug_worker_tag", None)
+        pioneer = self.workers.find_by_tag(pioneer_tag) if pioneer_tag and self.workers else None
+        self._claimjumper_reassert_pioneer_scouting(pioneer)
+
+        if cc.type_id == UnitTypeId.PLANETARYFORTRESS:
+            self._claimjumper_pf_queued = False
+            await self._develop_claimjumper_pf_economy(cc, tag)
+            return
+
+        if cc.type_id != UnitTypeId.COMMANDCENTER:
+            return
+
+        # While the CC is still constructing, the pioneer is (usually) the builder — do not
+        # spam refinery/CC build or let staffing yank them with gather every frame.
+        if not cc.is_ready:
+            return
+
+        morphing = self._claimjumper_morphing_to_pf(cc)
+        pf_queued = getattr(self, "_claimjumper_pf_queued", False)
+        if morphing or pf_queued:
+            await self._claimjumper_pioneer_during_pf_morph(cc, pioneer, tag)
+            return
+
+        await self._develop_claimjumper_cc_phase(cc, pioneer, tag)
+
     def _claimjumper_keep_mining(self) -> None:
         """Keep economy alive during claimjumper-location debug mode."""
         if self.workers.idle and self.mineral_field:
@@ -208,6 +821,7 @@ class ProcyonBot(AresBot):
         2) assign one SCV as scout/claimer
         3) move SCV to target
         4) place and start Command Center
+        5) develop base: eBay at main, SCVs + gas + PF at claimjumper
         """
         target = self.get_claimjumper_target()
         if target is None:
@@ -228,18 +842,16 @@ class ProcyonBot(AresBot):
                 chat=True,
             )
 
-        # Debug mode behavior is intentionally one-shot: attempt this location once only.
-        if getattr(self, "_claimjumper_single_attempt_done", False):
-            if not getattr(self, "_claimjumper_single_attempt_done_logged", False):
-                self._claimjumper_single_attempt_done_logged = True
-                await self._log(
-                    tag,
-                    "Single-attempt mode: no further claimjumper rebuild attempts will be made.",
-                    chat=True,
-                )
-            return
+        ready_th = self._townhall_at_point(target)
+        cc_pending = self.structures(UnitTypeId.COMMANDCENTER).not_ready.closer_than(9, target)
+        if (
+            ready_th is not None
+            or cc_pending
+            or getattr(self, "_claimjumper_cc_order_logged", False)
+        ):
+            await self._ensure_claimjumper_engineering_bay()
 
-        if self._townhall_at_point(target) is not None:
+        if ready_th is not None:
             if not getattr(self, "_claimjumper_cc_complete_logged", False):
                 self._claimjumper_cc_complete_logged = True
                 await self._log(
@@ -247,12 +859,24 @@ class ProcyonBot(AresBot):
                     f"Townhall established near target at {target}",
                     chat=True,
                 )
+            await self._develop_claimjumper_base(ready_th, tag)
+            return
+
+        if cc_pending:
+            if not getattr(self, "_claimjumper_cc_started_logged", False):
+                self._claimjumper_cc_started_logged = True
+                await self._log(
+                    tag,
+                    f"Command Center started near target at {cc_pending.first.position}",
+                    chat=True,
+                )
             return
 
         debug_tag = getattr(self, "_claimjumper_debug_worker_tag", None)
         worker = self.workers.find_by_tag(debug_tag) if (debug_tag is not None and self.workers) else None
         if worker is None and self.workers:
-            worker = self.workers.closest_to(target)
+            idle = self.workers.idle
+            worker = idle.closest_to(target) if idle else self.workers.closest_to(target)
             self._claimjumper_debug_worker_tag = worker.tag
             try:
                 self.mediator.assign_role(tag=worker.tag, role=UnitRole.SCOUTING)
@@ -268,9 +892,9 @@ class ProcyonBot(AresBot):
 
         # Optional periodic telemetry for "what is the SCV thinking?".
         if trace:
-        next_trace_time = getattr(self, "_claimjumper_next_trace_time", 0.0)
+            next_trace_time = getattr(self, "_claimjumper_next_trace_time", 0.0)
             if self.time >= next_trace_time:
-            self._claimjumper_next_trace_time = self.time + self.CLAIMJUMPER_TRACE_INTERVAL_S
+                self._claimjumper_next_trace_time = self.time + self.CLAIMJUMPER_TRACE_INTERVAL_S
                 order_summary = "idle"
                 if worker.orders:
                     try:
@@ -311,7 +935,7 @@ class ProcyonBot(AresBot):
                     worker.position.distance_to(last_pos) if last_pos is not None else 999.0
                 )
                 self._claimjumper_last_trace_pos = worker.position
-            if moved < self.CLAIMJUMPER_PATHING_STAGNANT_MOVE_DELTA:
+                if moved < self.CLAIMJUMPER_PATHING_STAGNANT_MOVE_DELTA:
                     if not hasattr(self, "_claimjumper_stagnant_since"):
                         self._claimjumper_stagnant_since = self.time
                 else:
@@ -328,27 +952,22 @@ class ProcyonBot(AresBot):
                 chat=True,
             )
 
-        # If a CC is already being built near the target, report once and stop issuing orders.
-        cc_pending = self.structures(UnitTypeId.COMMANDCENTER).not_ready.closer_than(9, target)
-        if cc_pending:
-            if not getattr(self, "_claimjumper_cc_started_logged", False):
-                self._claimjumper_cc_started_logged = True
-                await self._log(
-                    tag,
-                    f"Command Center started near target at {cc_pending.first.position}",
-                    chat=True,
-                )
-            return
-
         # Try to start CC at target using the same path as the working baseline:
         # prefer expand_now(location=target), fallback to build(... near=target).
+        if getattr(self, "_claimjumper_single_attempt_done", False):
+            return
+
         if not self.can_afford(UnitTypeId.COMMANDCENTER):
             return
 
-        # Keep the scout nudged toward target only when it is idle and far away.
-        if worker.is_idle and worker.position.distance_to(target) > self.CLAIMJUMPER_IDLE_NUDGE_RADIUS:
+        # Nudge toward target even if the build runner keeps the SCV non-idle (opening orders).
+        if worker.position.distance_to(target) > self.CLAIMJUMPER_IDLE_NUDGE_RADIUS:
             if self.time >= getattr(self, "_claimjumper_next_move_nudge_time", 0.0):
                 self._claimjumper_next_move_nudge_time = self.time + self.CLAIMJUMPER_MOVE_NUDGE_INTERVAL_S
+                try:
+                    self.mediator.assign_role(tag=worker.tag, role=UnitRole.SCOUTING)
+                except Exception:
+                    pass
                 worker.move(target)
 
         # Use a short retry cadence so we don't spam build requests every frame.
@@ -356,28 +975,21 @@ class ProcyonBot(AresBot):
             return
         self._claimjumper_next_build_attempt_time = self.time + self.CLAIMJUMPER_BUILD_RETRY_INTERVAL_S
 
+        # Single pioneer only — expand_now can assign a different SCV than our scout.
         issued = False
         issued_via = None
         try:
-            # Works like natural expansion but at a custom location.
-            await self.expand_now(location=target)
-            issued = True
-            issued_via = "expand_now"
+            issued = await self.build(
+                UnitTypeId.COMMANDCENTER,
+                near=target,
+                max_distance=12,
+                build_worker=worker,
+                random_alternative=False,
+                placement_step=1,
+            )
+            issued_via = "build_pioneer" if issued else None
         except Exception:
             issued = False
-
-        if not issued:
-            try:
-                issued = await self.build(
-                    UnitTypeId.COMMANDCENTER,
-                    near=target,
-                    max_distance=12,
-                    random_alternative=True,
-                    placement_step=1,
-                )
-                issued_via = "build_near_target" if issued else None
-            except Exception:
-                issued = False
 
         if issued:
             # Log once on initial accepted order. Construction start/complete is validated separately.
@@ -386,7 +998,8 @@ class ProcyonBot(AresBot):
                 self._claimjumper_single_attempt_done = True
                 await self._log(
                     tag,
-                    f"Command Center order accepted near target {target} (via {issued_via})",
+                    f"Command Center order accepted near target {target} (via {issued_via}); "
+                    "no further claimjumper CC orders at this target.",
                     chat=True,
                 )
             return
@@ -420,9 +1033,9 @@ class ProcyonBot(AresBot):
             stagnant_since = getattr(self, "_claimjumper_stagnant_since", self.time)
             stagnant_for = self.time - stagnant_since
             if (
-            getattr(self, "_claimjumper_unreachable_error_streak", 0)
-            >= self.CLAIMJUMPER_UNREACHABLE_STREAK_FOR_REPORT
-            and stagnant_for >= self.CLAIMJUMPER_PATHING_STAGNANT_TIME_S
+                getattr(self, "_claimjumper_unreachable_error_streak", 0)
+                >= self.CLAIMJUMPER_UNREACHABLE_STREAK_FOR_REPORT
+                and stagnant_for >= self.CLAIMJUMPER_PATHING_STAGNANT_TIME_S
                 and not getattr(self, "_claimjumper_pathing_error_reported", False)
             ):
                 self._claimjumper_pathing_error_reported = True
@@ -527,6 +1140,26 @@ class ProcyonBot(AresBot):
                     chat=True,
                 )
 
+    async def on_end(self, game_result: Result) -> None:
+        await super().on_end(game_result)
+        if self._claimjumper_enabled():
+            self._larceny_print_summary_line("END —")
+        if not self._verify_enabled("claimjumper"):
+            return
+        latched = getattr(self, "_verify_latched", set())
+        hit_ids = {sid for (st, sid) in latched if st == "claimjumper"}
+        missing = [s for s in self.CLAIMJUMPER_VERIFY_EXPECTED_STEPS if s not in hit_ids]
+        summary = (
+            f"[VERIFY][claimjumper] END game_result={game_result} "
+            f"hit={len(hit_ids)}/{len(self.CLAIMJUMPER_VERIFY_EXPECTED_STEPS)} "
+            f"missing={missing}"
+        )
+        print(summary)
+        print(
+            "[VERIFY][claimjumper] TODO: Sync pioneer dispatch with ares Build Runner — "
+            "SCV often cannot leave until opener steps finish; fix timing next (not path-only)."
+        )
+
     async def on_step(self, iteration: int):
         debug_expand_baseline = self._expand_baseline_enabled()
         if debug_expand_baseline:
@@ -544,6 +1177,7 @@ class ProcyonBot(AresBot):
         if self._claimjumper_enabled():
             log_tag = "claimjumper_location" if self._claimjumper_location_debug_enabled() else "claimjumper"
             await self._run_claimjumper_build_logic(tag=log_tag, trace=self._claimjumper_trace_enabled())
+            await self._verify_claimjumper_milestones()
 
         # Tag when each opening building completes (so we can verify order vs build runner)
         planned_depots, planned_rax = 2, 2  # TwoRaxMarines opener
@@ -571,6 +1205,17 @@ class ProcyonBot(AresBot):
             self, "build_order_runner", None
         ) and getattr(self.build_order_runner, "build_completed", False)
         if not build_done:
+            # Ares/mineral logic runs in super() before this; re-staff claimjump before we exit.
+            if self._claimjumper_enabled():
+                t = self.get_claimjumper_target()
+                if t is not None:
+                    cj = self._townhall_at_point(t)
+                    if cj is not None and cj.type_id in (
+                        UnitTypeId.COMMANDCENTER,
+                        UnitTypeId.PLANETARYFORTRESS,
+                    ):
+                        self._claimjumper_staff_claimsite_workers_gas_first(cj)
+                self._larceny_tick()
             return
 
         # Tag 1: Build runner considers itself done (all commands issued)
@@ -615,6 +1260,9 @@ class ProcyonBot(AresBot):
                 # Don't steal back the debug claimjumper worker while we are testing.
                 if debug_tag is not None and worker.tag == debug_tag:
                     continue
+                # Claimjumper site: gas-first staffing only (global mineral gather overrides it).
+                if self._worker_in_claimjumper_staffing_zone(worker):
+                    continue
                 self.mediator.assign_role(tag=worker.tag, role=UnitRole.GATHERING)
                 mineral = self.mineral_field.closest_to(worker.position)
                 worker.gather(mineral)
@@ -622,6 +1270,8 @@ class ProcyonBot(AresBot):
         # Train SCVs from idle CCs when we can afford and base is not saturated
         if self.townhalls:
             for cc in self.townhalls:
+                if self._claimjumper_enabled() and self._is_claimjumper_townhall(cc):
+                    continue
                 if cc.is_idle and self.can_afford(UnitTypeId.SCV) and not self._base_saturated(cc):
                     cc.train(UnitTypeId.SCV)
 
@@ -652,7 +1302,7 @@ class ProcyonBot(AresBot):
             and depot_pending == 0
             and not supply_depot_order_pending
         ):
-            base = self.townhalls.first.position if self.townhalls else self.start_location
+            base = self._macro_placement_anchor()
             # Use ares pre-calculated placement so depots don't block the mineral line.
             # TODO: brittle—relies on map/base assumptions; add fallback to building
             # near a safe point (e.g. ramp) if placement fails or build never proceeds.
@@ -663,7 +1313,7 @@ class ProcyonBot(AresBot):
                 find_alternative=True,
             )
             if pos is not None:
-                worker = self.mediator.select_worker(target_position=pos)
+                worker = self._select_worker_for_main_base_build(pos)
                 if worker is not None:
                     if self.mediator.build_with_specific_worker(
                         worker=worker,
@@ -688,7 +1338,7 @@ class ProcyonBot(AresBot):
             and not barracks_order_pending
             and len(self.structures(UnitTypeId.SUPPLYDEPOT).ready) >= 1
         ):
-            base = self.townhalls.first.position if self.townhalls else self.start_location
+            base = self._macro_placement_anchor()
             pos = self.mediator.request_building_placement(
                 base_location=base,
                 structure_type=UnitTypeId.BARRACKS,
@@ -696,7 +1346,7 @@ class ProcyonBot(AresBot):
                 find_alternative=True,
             )
             if pos is not None:
-                worker = self.mediator.select_worker(target_position=pos)
+                worker = self._select_worker_for_main_base_build(pos)
                 if worker is not None:
                     if self.mediator.build_with_specific_worker(
                         worker=worker,
@@ -709,6 +1359,28 @@ class ProcyonBot(AresBot):
             and self.structure_pending(UnitTypeId.BARRACKS) > 0
         ):
             self._barracks_order_pending = False
+
+        # Last in frame: override Ares + idle gather so claimjump stays gas-first.
+        if self._claimjumper_enabled():
+            t = self.get_claimjumper_target()
+            if t is not None:
+                cj_th = self._townhall_at_point(t)
+                if cj_th is not None and cj_th.type_id in (
+                    UnitTypeId.COMMANDCENTER,
+                    UnitTypeId.PLANETARYFORTRESS,
+                ):
+                    self._claimjumper_staff_claimsite_workers_gas_first(cj_th)
+
+        # Larceny Ledger: attribute deposits near the ninja townhall only (after all orders).
+        if self._claimjumper_enabled():
+            self._larceny_tick()
+
+    async def on_unit_destroyed(self, unit_tag: int) -> None:
+        await super().on_unit_destroyed(unit_tag)
+        if not self._claimjumper_enabled():
+            return
+        if unit_tag == getattr(self, "_larceny_ninja_th_tag", None):
+            await self._larceny_on_ninja_base_lost()
 
 
 def main():

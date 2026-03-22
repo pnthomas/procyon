@@ -65,9 +65,61 @@ Tags:
 - `macro`: reserved for future use
 - `claimjumper`: log claimjumper target position when computed
 - `expand_baseline`: minimal baseline (suspend macro/build-order, keep mining, use built-in `expand_now()` to take natural, log started/completed)
+- `larceny_ledger`: when the ninja claimjump townhall is destroyed, mirror the Larceny summary to in-game chat
 - `claimjumper_location`: SCV telemetry for claimjumper behavior (orders, movement, distance, action errors)
-  - Claimjumper itself is selected by `PROCYON_BUILD=claimjumper...` and is one-shot: after the first accepted CC order, it will not issue further claimjumper rebuild attempts.
+  - Claimjumper is selected by `PROCYON_BUILD=claimjumper...`. Only one claimjumper CC order is issued per game. **Pioneer-only** for building refineries (no main SCV pulls). Depots/barracks/eBay anchor to the **main** townhall nearest your start. Pipeline: **both** refineries → staff gas-first and **queue SCVs from the CC** until PF is affordable → morph → then **normal** saturation (gas-first staffing), same pattern you’ll eventually share with other bases.
   - Includes a pathing error report if the SCV repeatedly hits `result=208` / `ability=318` while stationary (suggesting map/pathing geometry issues).
+
+### Verification (self-evaluation milestones)
+
+Set **`PROCYON_VERIFY`** to a comma-separated list of **strategy names** (lowercase). Each enabled strategy emits **one-shot** lines to the **terminal** and **in-game chat** when milestones pass, driven by **game state** (not timers). After the game, **`on_end`** prints a **summary** of which expected steps never fired.
+
+```bash
+PROCYON_VERIFY=claimjumper PROCYON_BUILD=claimjumper python bot.py
+```
+
+**Design (extensible to other builds):**
+
+| Piece | Role |
+|-------|------|
+| `PROCYON_VERIFY` | Which strategies run milestone hooks (`claimjumper`, later e.g. `standard`). |
+| `[VERIFY][strategy] step_id \| detail` | Stable prefix for grepping replays, logs, and chat. |
+| `_verify_latched` | `(strategy, step_id)` pairs already reported — each milestone fires once. |
+| `CLAIMJUMPER_VERIFY_EXPECTED_STEPS` | Checklist for **`on_end`** `missing=[...]` summary. |
+| `_verify_warn_once` | Optional diagnostics (e.g. blocked path) without spamming. |
+| **`on_end` TODO line** | Printed after the summary: known follow-up (e.g. pioneer vs Build Runner timing). |
+
+Independent of **`PROCYON_DEBUG`** — use verify for pass/fail checklists; use debug for noisy traces.
+
+**Claimjumper milestones (`PROCYON_VERIFY=claimjumper`)**
+
+| Chat / log id | Trigger (game state) |
+|---------------|----------------------|
+| `cj_scv_dispatched` | Pioneer tag set and that SCV still exists. |
+| `cj_scv_arrived` | Pioneer distance to claim target &lt; `CLAIMJUMPER_ARRIVAL_RADIUS`. |
+| `cj_cc_order_issued` | `_claimjumper_cc_order_logged` (build accepted). |
+| `cj_cc_under_construction` | Not-ready `COMMANDCENTER` within 9 of claim target (supplementary). |
+| `cj_cc_built` | Ready `COMMANDCENTER` at claim (pre-PF). |
+| `cj_ebay_ready` | At least one ready `ENGINEERINGBAY` (PF tech; useful when debugging walls). |
+| `cj_refinery_1of2_order` | Pioneer issued `build_gas` for the first open geyser (one-shot). |
+| `cj_refinery_2of2_order` | Same for the second geyser. |
+| `cj_extractor_1of2` | ≥1 refinery structure near claim anchor (CC or building CC). |
+| `cj_extractor_2of2` | ≥2 refineries near claim. |
+| `cj_extractors_gas_saturated` | SCVs within 5 of each **ready** refinery ≥ 3×(number of ready refs). |
+| `cj_bank_150gas` | `vespene >= 150` while claim townhall exists. |
+| `cj_pf_order_issued` | `_claimjumper_pf_upgrade_logged`. |
+| `cj_pf_morphing` | CC has PF morph ability in orders (supplementary). |
+| `cj_pf_complete` | Claim townhall type is `PLANETARYFORTRESS`. |
+| `WARN cj_warn_scv_blocked` | Once: dispatched &gt;50s game time and never `cj_scv_arrived` — often **Build Runner** still owning the SCV, not only walls. |
+
+**End-of-game:** `[VERIFY][claimjumper] END game_result=... hit=N/M missing=[...]` plus a **`TODO:`** line for the next agreed fix (e.g. pioneer vs opener).
+
+### Larceny Ledger (ninja base only)
+
+When **`PROCYON_BUILD`** starts with `claimjumper`, the bot tracks **minerals and gas gathered that are deposited at the claimjump townhall** (CC or PF). It does **not** walk all bases: only SCVs and MULEs are checked, and only deposits inferred from **carrying → not carrying** transitions while the worker is near the ninja CC/PF (standard **8** minerals and **4** gas per trip).
+
+- **Terminal:** `[Larceny] END — gathered=…` on every game end, with **net** vs static **~1700m ~150g** invest estimate.
+- **Ninja base killed:** `[Larceny] Ninja base destroyed — …` once. Add **`larceny_ledger`** to **`PROCYON_DEBUG`** for a short in-game chat line as well.
 
 ### Vendored sc2_helper
 

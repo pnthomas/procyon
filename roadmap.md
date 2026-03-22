@@ -25,19 +25,25 @@ Only the modules Ninja Turtle v0 needs first.
 
 ### 3.1 Claimjumper (aggressive expansion to opponent’s side)
 
-- **Scout / map:** Identify enemy 4th (or equivalent expansion on opponent’s side).
-- **Send SCV:** Dispatch SCV(s) early; path to that base (avoid enemy if visible).
+- ~~**Scout / map:** Identify enemy 4th (or equivalent expansion on opponent’s side).~~
+- ~~**Send SCV:** Dispatch SCV(s) early; path to that base (avoid enemy if visible).~~
 - **Build:** Planetary Fortress at that location; add extractors; saturate with SCVs (or partial + MULEs).
-- **Defend / retreat:** Simple rule when base is under attack (pull SCVs or accept loss).
+- **Defend / retreat:**
+  - If enemy forces attack workers at the claim, **flee SCVs to the far side of the PF** (use the structure as cover / break contact) rather than fighting.
+  - **Repair the PF** with nearby SCVs when it is taking damage.
+  - **Missile turrets:** Once the base is **saturated**, build **3 missile turrets** near the PF. **Replace** turrets that are destroyed, only when it is **safe** to do so (no complex micro — defer if contested).
 - **Integration:** Enabled only when Ninja Turtle (or another build) enables Claimjumper; build order leaves minerals/gas and an SCV available at the right time.
+- **Polish:**
+  - **Pioneer egress vs opener:** CC order can be accepted early, but the SCV often **does not actually leave** until **barracks and depots** from the Build Runner finish — integrate dispatch / worker ownership so the pioneer moves out as soon as we intend (not only when the wall is done building).
+  - **Claimjump staffing (gas vs minerals):** Staffing currently **overfills gas** and leaves **minerals understaffed** at the claim. Fix so per-base gas follows the intended cap (e.g. 3 per refinery) without pulling excess SCVs onto gas, and **mineral patches** at the claim reach correct saturation relative to workers assigned there.
 
 ### 3.2 Larceny Ledger (ninja-base resource tracking)
 
-- **Purpose:** Track total resources collected by the ninja base to measure cost-effectiveness and how much we “steal” before it’s found.
-- **Implementation (delta check):** Store total minerals (and optionally gas) at iteration N; at N+1, if total increased, find workers that just finished GATHER/RETURN near a base; attribute the increase to the nearest base; if that base is the ninja CC/PF, add to the ledger.
-- **Ledger state:** Running totals for the ninja base only; expose for logging or post-game analysis.
-- **Integration:** Update only when Claimjumper is active and the ninja base exists; attribute by distance (worker finished return near this CC/PF).
-- Add a tag when the base is destroyed to report how much that base gathered verus the total invested (use 1,700 minerals and 150 gas as static estimate for simplicity for now).
+- ~~**Purpose:** Track total resources collected by the ninja base to measure cost-effectiveness and how much we “steal” before it’s found.~~ *(Done in `bot.py`.)*
+- ~~**Implementation:** Only SCVs/MULEs are scanned. Each step, units that transition from carrying minerals or gas to not carrying while within range of the **ready** claimjump CC/PF add **8 minerals** or **4 gas** per trip (standard loads; gold not distinguished). No global bank deltas — avoids mis-attributing spends.~~
+- ~~**Ledger / output:** `_larceny_gathered_minerals`, `_larceny_gathered_vespene`; **`on_end`** prints `[Larceny] END — gathered=…` with net vs static est. invest **1700m + 150g**.~~
+- ~~**When it runs:** `PROCYON_BUILD=claimjumper…`; `_larceny_tick()` after claimjumper staffing each frame (including during the opener branch once the ninja TH exists).~~
+- ~~**Base lost:** `on_unit_destroyed` matching the ninja townhall tag → one-time `[Larceny] Ninja base destroyed — …`; optional in-game line if `PROCYON_DEBUG=larceny_ledger`.~~
 
 ### 3.3 Turtle on our side (bunkers, PF, float CCs)
 
@@ -83,6 +89,16 @@ Only the modules Ninja Turtle v0 needs first.
 ---
 
 ## Phase 6: Future work (additional modules and strategies)
+
+Strategy and build are synonomous. They represent the overall theory of the game, and dictate things like unit composition, build order, etc.
+
+Strategies
+
+- Claimjump
+  - Marines
+  - Reaper Viking
+
+Modules/Behaviors: Micro
 
 - **Repair strategies:** Quick fix (SCV repairs high-value damaged units); tactical repair bases (forward SCVs); Mules jump (MULEs with harassment BCs).
 - **Chill tanks:** Siege/unsiege logic considering nearby enemies and other tank coverage; usable in mech builds.
